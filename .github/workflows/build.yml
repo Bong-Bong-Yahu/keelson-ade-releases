@@ -1,0 +1,86 @@
+name: Build
+
+# Builds Keelson ADE from its private source repo on GitHub's free public-repo
+# runners. Only the owner can start it (workflow_dispatch; no push/PR triggers,
+# so a fork can never run it with the token). The source is checked out with
+# GH_TOKEN and never printed; installers land as artifacts, and publish=true
+# makes them a release here, which is the app's auto-update feed.
+on:
+  workflow_dispatch:
+    inputs:
+      ref: { description: 'Branch or tag of Bong-Bong-Yahu/aegis-ade', required: true, default: main }
+      publish: { description: 'Publish a release (auto-update feed)', type: boolean, default: false }
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: Bong-Bong-Yahu/aegis-ade, ref: '${{ inputs.ref }}', token: '${{ secrets.GH_TOKEN }}', persist-credentials: false }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - run: npx vitest run
+      # build and smoke even when a unit test fails: the job stays red, but the
+      # installer and the smoke verdict are still there to look at
+      - if: ${{ !cancelled() }}
+        run: npx vite build
+      - if: ${{ !cancelled() }}
+        run: npx electron-builder --win --publish never
+      - name: Install silently, then smoke the installed app
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem release\Keelson-ADE-Setup-*.exe | Select-Object -First 1
+          Start-Process $setup.FullName -ArgumentList '/S' -Wait
+          $exe = "$env:LOCALAPPDATA\Programs\Keelson ADE\Keelson ADE.exe"
+          if (-not (Test-Path $exe)) { Write-Error "installer did not put $exe"; exit 1 }
+          $p = Start-Process $exe -ArgumentList '--smoke' -Wait -PassThru -RedirectStandardOutput smoke.out -RedirectStandardError smoke.err
+          Get-Content smoke.out, smoke.err
+          if ($p.ExitCode -ne 0) { Write-Error "smoke exited $($p.ExitCode)"; exit 1 }
+          if (-not (Select-String -Path smoke.out -Pattern 'SMOKE OK' -Quiet)) { Write-Error 'no SMOKE OK'; exit 1 }
+      - if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: keelson-ade-windows
+          path: |
+            release/Keelson-ADE-Setup-*.exe
+            release/Keelson-ADE-Portable-*.exe
+          if-no-files-found: error
+      # publishes only when asked, and only after tests and the smoke passed
+      # (electron-builder names the release v<package.json version>)
+      - name: Publish release (publish=true only)
+        if: ${{ success() && inputs.publish }}
+        env: { GH_TOKEN: '${{ secrets.GH_TOKEN }}' }
+        run: npx electron-builder --win --publish always
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: Bong-Bong-Yahu/aegis-ade, ref: '${{ inputs.ref }}', token: '${{ secrets.GH_TOKEN }}', persist-credentials: false }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - run: npx vitest run
+      - if: ${{ !cancelled() }}
+        run: npx vite build
+      - if: ${{ !cancelled() }}
+        run: npx electron-builder --linux --publish never
+      - name: Smoke the packaged app
+        if: ${{ !cancelled() }}
+        run: |
+          xvfb-run -a release/linux-unpacked/aegis-ade --smoke --no-sandbox | tee smoke.out
+          grep -q 'SMOKE OK' smoke.out
+      - if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: keelson-ade-linux
+          path: release/Keelson-ADE-*.AppImage
+          if-no-files-found: error
+      # publishes only when asked, and only after tests and the smoke passed
+      # (electron-builder names the release v<package.json version>)
+      - name: Publish release (publish=true only)
+        if: ${{ success() && inputs.publish }}
+        env: { GH_TOKEN: '${{ secrets.GH_TOKEN }}' }
+        run: npx electron-builder --linux --publish always
