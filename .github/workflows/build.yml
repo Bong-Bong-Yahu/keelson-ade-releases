@@ -5,6 +5,14 @@ name: Build
 # so a fork can never run it with the token). The source is checked out with
 # GH_TOKEN and never printed; installers land as artifacts, and publish=true
 # makes them a release here, which is the app's auto-update feed.
+#
+# Every build is proven by the robot (the source's `--robot` mode driving the real
+# UI of the INSTALLED app, with a fake `claude` from tests/fixtures/fake-claude.js,
+# fresh profile, signed out), plus the reliability checks in qa/robot/. Step 4
+# (agents messaging each other, and a separate session outside the app) runs real
+# Claude Code on Haiku only when the ANTHROPIC_API_KEY secret exists; otherwise the
+# robot prints ROBOT SKIP 4. Step 6 (update while busy) installs the latest
+# published release and updates it to this build from a feed on 127.0.0.1.
 on:
   workflow_dispatch:
     inputs:
@@ -14,6 +22,8 @@ on:
 jobs:
   windows:
     runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with: { repository: Bong-Bong-Yahu/aegis-ade, ref: '${{ inputs.ref }}', token: '${{ secrets.GH_TOKEN }}', persist-credentials: false }
@@ -21,55 +31,104 @@ jobs:
         with: { node-version: 22, cache: npm }
       - run: npm ci
       - run: npx vitest run
-      # build and smoke even when a unit test fails: the job stays red, but the
-      # installer and the smoke verdict are still there to look at
+      # build and run the robot even when a unit test fails: the job stays red, but
+      # the installer and the robot's verdict are still there to look at
       - if: ${{ !cancelled() }}
         run: npx vite build
-      - if: ${{ !cancelled() }}
-        run: npx electron-builder --win --publish never
-      - name: Install silently, then smoke the installed app
+      # a test build is one patch above the source's version (0.1.3-robot.<run>), so
+      # step 6 has something newer than the published release to update to; a
+      # publish build keeps package.json's version untouched
+      - id: version
         if: ${{ !cancelled() }}
         shell: pwsh
         run: |
+          $v = node -p "require('./package.json').version"
+          if ('${{ inputs.publish }}' -ne 'true') { $p = $v.Split('-')[0].Split('.'); $v = "$($p[0]).$($p[1]).$([int]$p[2] + 1)-robot.${{ github.run_number }}" }
+          "version=$v" >> $env:GITHUB_OUTPUT
+          Write-Host "building $v"
+      - if: ${{ !cancelled() }}
+        run: npx electron-builder --win --publish never -c.extraMetadata.version=${{ steps.version.outputs.version }}
+      - name: Robot setup (fresh profile, fake claude signed out, seeded repo)
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          pwsh qa/robot/final.ps1 -Snapshot "$env:RUNNER_TEMP\before.json"
           $setup = Get-ChildItem release\Keelson-ADE-Setup-*.exe | Select-Object -First 1
           Start-Process $setup.FullName -ArgumentList '/S' -Wait
-          $exe = "$env:LOCALAPPDATA\Programs\Keelson ADE\Keelson ADE.exe"
-          if (-not (Test-Path $exe)) { Write-Error "installer did not put $exe"; exit 1 }
-          $p = Start-Process $exe -ArgumentList '--smoke' -Wait -PassThru -RedirectStandardOutput smoke.out -RedirectStandardError smoke.err
-          Get-Content smoke.out, smoke.err
-          if ($p.ExitCode -ne 0) { Write-Error "smoke exited $($p.ExitCode)"; exit 1 }
-          if (-not (Select-String -Path smoke.out -Pattern 'SMOKE OK' -Quiet)) { Write-Error 'no SMOKE OK'; exit 1 }
-      # A terminal must show text: the installed app, seeded with one restored
-      # Claude chat agent (team view) and then one shell (grid view), presses
-      # Terminal the way a person does and measures what was drawn (smoketerm.js).
-      - name: Terminal smoke (team view chat Terminal, grid shell)
+          if (-not (Test-Path "$env:LOCALAPPDATA\Programs\Keelson ADE\Keelson ADE.exe")) { Write-Error 'installer put no app'; exit 1 }
+          # the fake installed the way npm installs claude: a .js and a cmd-shim beside it
+          New-Item -ItemType Directory -Force C:\fakeclaude, "$env:RUNNER_TEMP\fake-state" | Out-Null
+          Copy-Item tests\fixtures\fake-claude.js C:\fakeclaude\claude.js
+          Set-Content -NoNewline C:\fakeclaude\claude.cmd "@ECHO off`r`nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & `"%_prog%`"  `"%dp0%\claude.js`" %*`r`n"
+          $repo = "$env:RUNNER_TEMP\robot-repo"
+          git init -q $repo; Set-Content "$repo\README.md" 'robot'; git -C $repo add -A; git -C $repo -c user.name=robot -c user.email=robot@example.invalid commit -qm seed
+          "KEELSON_ROBOT_FOLDER=$repo" >> $env:GITHUB_ENV
+          "FAKE_CLAUDE_STATE=$env:RUNNER_TEMP\fake-state" >> $env:GITHUB_ENV
+          "SHOTS=$env:RUNNER_TEMP\robot-shots" >> $env:GITHUB_ENV
+      # 1b: Git hidden (PATH and the Program Files roots hasGitBash looks in), so the
+      # app must offer Install Git. Its profile is then removed: `first` starts fresh.
+      - name: Robot nogit (step 1b)
         if: ${{ !cancelled() }}
         shell: pwsh
         run: |
-          npm i -g @anthropic-ai/claude-code | Out-Null
-          $exe = "$env:LOCALAPPDATA\Programs\Keelson ADE\Keelson ADE.exe"
-          $proj = "$env:RUNNER_TEMP\proj"; New-Item -ItemType Directory -Force $proj | Out-Null
-          git -C $proj init -q
-          $cfg = "$env:APPDATA\aegis-ade"; New-Item -ItemType Directory -Force $cfg | Out-Null
-          $fail = 0
-          foreach ($run in @(@{ view = 'team'; agent = 'claude'; id = 't1' }, @{ view = 'grid'; agent = 'shell'; id = 'g1' })) {
-            $wb = @{ version = 1; activeWorkspaceId = 'w1'; ui = @{ view = $run.view }
-              workspaces = @(@{ id = 'w1'; title = 'proj'; cwd = $proj; color = '#d9b766'; slots = @(@{ id = $run.id; agent = $run.agent }) }) }
-            $wb | ConvertTo-Json -Depth 6 | Set-Content -Encoding utf8NoBOM "$cfg\workbench.json"
-            $out = "$env:RUNNER_TEMP\smoke-shots\$($run.view)"
-            # WaitForExit on the app alone: Start-Process -Wait would wait on the detached daemon and slot hosts too
-            $p = Start-Process $exe -ArgumentList '--smoke', '--smoke-term', "--smoke-out=$out" -PassThru -RedirectStandardOutput "smoke-term-$($run.view).out" -RedirectStandardError "smoke-term-$($run.view).err"
-            if (-not $p.WaitForExit(300000)) { Stop-Process -Id $p.Id -Force; Write-Host "smoke-term $($run.view) hung" }
-            Get-Content "smoke-term-$($run.view).out" | Select-String 'SMOKE|board|slot'
-            if (-not (Select-String -Path "smoke-term-$($run.view).out" -Pattern 'SMOKE OK' -Quiet)) { $fail = 1 }
-          }
-          Get-Content "$env:TEMP\aegis-ade\boardd.log" -ErrorAction SilentlyContinue | Select-Object -Last 40
-          exit $fail
+          $env:Path = 'C:\fakeclaude;' + (($env:Path -split ';' | Where-Object { $_ -notmatch '\\Git\\' }) -join ';')
+          $empty = New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\no-programs"
+          $env:ProgramFiles = $empty; ${env:ProgramFiles(x86)} = $empty; $env:ProgramW6432 = $empty
+          pwsh qa/robot/run.ps1 -Script nogit -Out "$env:SHOTS\nogit"; $r = $LASTEXITCODE
+          Get-Process 'Keelson ADE' -ErrorAction SilentlyContinue | Stop-Process -Force
+          Remove-Item -Recurse -Force "$env:APPDATA\aegis-ade", "$env:FAKE_CLAUDE_STATE\*" -ErrorAction SilentlyContinue
+          exit $r
+      - name: Robot first (steps 1-3, fake claude)
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $env:Path = "C:\fakeclaude;$env:Path"
+          pwsh qa/robot/run.ps1 -Script first -Out "$env:SHOTS\run"
+      - name: Robot agents (step 4, real claude on Haiku when the key exists)
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_MODEL: claude-haiku-4-5
+        run: |
+          if ($env:ANTHROPIC_API_KEY) {
+            npm i -g @anthropic-ai/claude-code | Out-Null
+            $real = Join-Path (npm root -g) '@anthropic-ai\claude-code\bin\claude.exe'
+            if (-not (Test-Path $real)) { $real = (Get-Command claude).Source }
+            Write-Host "real claude: $real $(& $real --version)"
+            # the outside session: started here, not by the app, alive for the whole step
+            $od = New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\outside"
+            $env:ROBOT_REAL_CLAUDE = $real
+            $outside = Start-Process node -ArgumentList 'qa/robot/outside.js', 'robot-outside', $od, "$env:SHOTS\outside.jsonl" -PassThru -NoNewWindow
+            $seen = $false
+            for ($i = 0; $i -lt 60 -and -not $seen; $i++) { Start-Sleep 2; $seen = [bool](& $real agents --json 2>$null | Select-String 'robot-outside') }
+            Write-Host "outside session registered: $seen"
+            $env:KEELSON_ROBOT_REAL = '1'; $env:ROBOT_OUTSIDE = 'robot-outside'
+          } else { Write-Host 'ANTHROPIC_API_KEY not set: step 4 is skipped' }
+          pwsh qa/robot/run.ps1 -Script agents -Out "$env:SHOTS\run"; $r = $LASTEXITCODE
+          if ($outside) { Stop-Process -Id $outside.Id -Force -ErrorAction SilentlyContinue; Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'robot-outside' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }
+          exit $r
+      - name: Robot restore (step 5, fake claude)
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $env:Path = "C:\fakeclaude;$env:Path"
+          pwsh qa/robot/run.ps1 -Script restore -Out "$env:SHOTS\run"
+      - name: Reliability over the whole run (log, crash dumps, services)
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          pwsh qa/robot/final.ps1 -Before "$env:RUNNER_TEMP\before.json"; $r = $LASTEXITCODE
+          New-Item -ItemType Directory -Force "$env:SHOTS\logs" | Out-Null
+          Copy-Item "$env:APPDATA\aegis-ade\logs\*" "$env:SHOTS\logs" -ErrorAction SilentlyContinue
+          Copy-Item "$env:TEMP\aegis-ade\boardd.log" "$env:SHOTS\logs" -ErrorAction SilentlyContinue
+          Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like "$env:LOCALAPPDATA\Programs\Keelson ADE\*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+          exit $r
       - if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
-          name: terminal-smoke-shots
-          path: ${{ runner.temp }}/smoke-shots
+          name: robot-shots-windows
+          path: ${{ runner.temp }}/robot-shots
           if-no-files-found: warn
       - if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
@@ -79,16 +138,94 @@ jobs:
             release/Keelson-ADE-Setup-*.exe
             release/Keelson-ADE-Portable-*.exe
           if-no-files-found: error
-      # publishes only when asked, and only after tests and the smoke passed
+      # step 6's feed: what an update server serves for this build
+      - if: ${{ !cancelled() && !inputs.publish }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: robot-update-feed
+          path: |
+            release/latest.yml
+            release/Keelson-ADE-Setup-*.exe
+            release/Keelson-ADE-Setup-*.exe.blockmap
+          if-no-files-found: error
+      # publishes only when asked, and only after tests and the robot passed
       # (electron-builder names the release v<package.json version>)
       - name: Publish release (publish=true only)
         if: ${{ success() && inputs.publish }}
         env: { GH_TOKEN: '${{ secrets.GH_TOKEN }}' }
         run: npx electron-builder --win --publish always
 
-  linux:
-    # after windows: a release is never published half-made (Linux files, no Windows ones)
+  # Step 6, update while busy: the latest published release, installed as a user has
+  # it, mid-turn, is offered this build from a feed on 127.0.0.1 (its installed
+  # resources\app-update.yml is pointed there on this runner only; the shipped
+  # config is untouched). It must wait, install once idle, and the restore must hold.
+  update:
     needs: windows
+    if: ${{ !cancelled() && !inputs.publish && needs.windows.outputs.version != '' }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: Bong-Bong-Yahu/aegis-ade, ref: '${{ inputs.ref }}', token: '${{ secrets.GH_TOKEN }}', persist-credentials: false }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - uses: actions/download-artifact@v4
+        with: { name: robot-update-feed, path: '${{ runner.temp }}/feed' }
+      - name: Install the latest published release, fake claude signed in, one agent seeded
+        shell: pwsh
+        env: { GH_TOKEN: '${{ github.token }}' }
+        run: |
+          $env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = '1'
+          npm i --prefix qa/robot --no-save --no-audit --no-fund playwright@1.59.1 | Out-Null
+          pwsh qa/robot/final.ps1 -Snapshot "$env:RUNNER_TEMP\before.json"
+          $tag = gh release view -R ${{ github.repository }} --json tagName -q .tagName
+          gh release download $tag -R ${{ github.repository }} -p 'Keelson-ADE-Setup-*.exe' -D "$env:RUNNER_TEMP\prev"
+          $setup = Get-ChildItem "$env:RUNNER_TEMP\prev\Keelson-ADE-Setup-*.exe" | Select-Object -First 1
+          Start-Process $setup.FullName -ArgumentList '/S' -Wait
+          $res = "$env:LOCALAPPDATA\Programs\Keelson ADE\resources"
+          Write-Host "installed $tag; its app-update.yml:"; Get-Content "$res\app-update.yml"
+          $cache = (Get-Content "$res\app-update.yml" | Select-String '^updaterCacheDirName:').Line
+          Set-Content "$res\app-update.yml" "provider: generic`nurl: http://127.0.0.1:8765/`n$cache`n"
+          New-Item -ItemType Directory -Force C:\fakeclaude, "$env:RUNNER_TEMP\fake-state" | Out-Null
+          Set-Content "$env:RUNNER_TEMP\fake-state\signed-in" 'robot'
+          Copy-Item tests\fixtures\fake-claude.js C:\fakeclaude\claude.js
+          Set-Content -NoNewline C:\fakeclaude\claude.cmd "@ECHO off`r`nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & `"%_prog%`"  `"%dp0%\claude.js`" %*`r`n"
+          $repo = "$env:RUNNER_TEMP\robot-repo"
+          git init -q $repo; Set-Content "$repo\README.md" 'robot'; git -C $repo add -A; git -C $repo -c user.name=robot -c user.email=robot@example.invalid commit -qm seed
+          $cfg = "$env:APPDATA\aegis-ade"; New-Item -ItemType Directory -Force $cfg | Out-Null
+          @{ version = 1; activeWorkspaceId = 'w1'; ui = @{ view = 'team' }
+             workspaces = @(@{ id = 'w1'; title = 'robot-repo'; cwd = $repo; color = '#d9b766'; slots = @(@{ id = 't1'; agent = 'claude' }) }) } |
+            ConvertTo-Json -Depth 6 | Set-Content -Encoding utf8NoBOM "$cfg\workbench.json"
+          "KEELSON_ROBOT_FOLDER=$repo" >> $env:GITHUB_ENV
+          "FAKE_CLAUDE_STATE=$env:RUNNER_TEMP\fake-state" >> $env:GITHUB_ENV
+          "SHOTS=$env:RUNNER_TEMP\robot-shots" >> $env:GITHUB_ENV
+      - name: Robot step 6 (update while busy), then restore on the updated app
+        shell: pwsh
+        run: |
+          $env:Path = "C:\fakeclaude;$env:Path"
+          node qa/robot/update.mjs "$env:RUNNER_TEMP\feed" '${{ needs.windows.outputs.version }}' "$env:SHOTS\update"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          pwsh qa/robot/run.ps1 -Script restore -Out "$env:SHOTS\update"
+      - name: Reliability over the update run
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          pwsh qa/robot/final.ps1 -Before "$env:RUNNER_TEMP\before.json"; $r = $LASTEXITCODE
+          New-Item -ItemType Directory -Force "$env:SHOTS\logs" | Out-Null
+          Copy-Item "$env:APPDATA\aegis-ade\logs\*" "$env:SHOTS\logs" -ErrorAction SilentlyContinue
+          Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like "$env:LOCALAPPDATA\Programs\Keelson ADE\*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+          exit $r
+      - if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: robot-shots-update
+          path: ${{ runner.temp }}/robot-shots
+          if-no-files-found: warn
+
+  linux:
+    # runs after windows; on a publish run only when windows passed, so a release
+    # is never published half-made (Linux files, no Windows ones)
+    needs: windows
+    if: ${{ !cancelled() && (needs.windows.result == 'success' || !inputs.publish) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -100,21 +237,42 @@ jobs:
       - if: ${{ !cancelled() }}
         run: npx vite build
       - if: ${{ !cancelled() }}
-        run: npx electron-builder --linux --publish never
-      - name: Smoke the packaged app
+        run: npx electron-builder --linux --publish never -c.extraMetadata.version=${{ needs.windows.outputs.version || '' }}
+      - name: Robot (AppImage under xvfb, fake claude; step 4 is Windows-only)
         if: ${{ !cancelled() }}
         run: |
-          xvfb-run -a release/linux-unpacked/aegis-ade --smoke --no-sandbox | tee smoke.out
-          grep -q 'SMOKE OK' smoke.out
+          sudo apt-get install -y -qq libfuse2t64 >/dev/null
+          img=$(ls release/Keelson-ADE-*.AppImage | head -1); chmod +x "$img"
+          units() { { systemctl --user list-unit-files --no-legend 2>/dev/null; ls ~/.config/autostart 2>/dev/null; } | sort; }
+          units >"$RUNNER_TEMP/units.before"
+          mkdir -p ~/fakeclaude "$RUNNER_TEMP/fake-state"
+          cp tests/fixtures/fake-claude.js ~/fakeclaude/claude; chmod +x ~/fakeclaude/claude
+          export PATH=~/fakeclaude:$PATH FAKE_CLAUDE_STATE=$RUNNER_TEMP/fake-state KEELSON_ROBOT_FOLDER=$RUNNER_TEMP/robot-repo
+          git init -q "$KEELSON_ROBOT_FOLDER"; echo robot >"$KEELSON_ROBOT_FOLDER/README.md"
+          git -C "$KEELSON_ROBOT_FOLDER" add -A; git -C "$KEELSON_ROBOT_FOLDER" -c user.name=robot -c user.email=robot@example.invalid commit -qm seed
+          shots=$RUNNER_TEMP/robot-shots; fail=0
+          for s in first agents restore; do bash qa/robot/run.sh $s "$shots/run" "$img" || fail=1; done
+          log=~/.config/aegis-ade/logs/main.log
+          if grep -E '\[main\] (uncaught|unhandled|renderer gone)' "$log"; then echo "CHECK FAIL final no-uncaught"; fail=1; else echo "CHECK OK final no-uncaught"; fi
+          units >"$RUNNER_TEMP/units.after"
+          if diff "$RUNNER_TEMP/units.before" "$RUNNER_TEMP/units.after"; then echo "CHECK OK final no-service"; else echo "CHECK FAIL final no-service"; fail=1; fi
+          mkdir -p "$shots/logs"; cp ~/.config/aegis-ade/logs/* "$shots/logs/" 2>/dev/null || true
+          exit $fail
+      - if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: robot-shots-linux
+          path: ${{ runner.temp }}/robot-shots
+          if-no-files-found: warn
       - if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: keelson-ade-linux
           path: release/Keelson-ADE-*.AppImage
           if-no-files-found: error
-      # publishes only when asked, and only after tests and the smoke passed
+      # publishes only when asked, and only after tests and the robot passed
       # (electron-builder names the release v<package.json version>)
       - name: Publish release (publish=true only)
-        if: ${{ success() && inputs.publish }}
+        if: ${{ success() && inputs.publish && needs.windows.result == 'success' }}
         env: { GH_TOKEN: '${{ secrets.GH_TOKEN }}' }
         run: npx electron-builder --linux --publish always
