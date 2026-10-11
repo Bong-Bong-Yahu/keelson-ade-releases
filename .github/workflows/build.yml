@@ -203,8 +203,6 @@ jobs:
         shell: pwsh
         env: { GH_TOKEN: '${{ github.token }}' }
         run: |
-          $env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = '1'
-          npm i --prefix qa/robot --no-save --no-audit --no-fund playwright@1.59.1 | Out-Null
           pwsh qa/robot/final.ps1 -Snapshot "$env:RUNNER_TEMP\before.json"
           $tag = gh release view -R ${{ github.repository }} --json tagName -q .tagName
           gh release download $tag -R ${{ github.repository }} -p 'Keelson-ADE-Setup-*.exe' -D "$env:RUNNER_TEMP\prev"
