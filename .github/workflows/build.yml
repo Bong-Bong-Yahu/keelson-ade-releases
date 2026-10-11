@@ -182,7 +182,15 @@ jobs:
       - name: Publish release (publish=true only)
         if: ${{ success() && inputs.publish }}
         env: { GH_TOKEN: '${{ secrets.GH_TOKEN }}' }
-        run: npx electron-builder --win --publish always
+        shell: pwsh
+        # the release is made here as a DRAFT, once: electron-builder's parallel uploads
+        # each tried to create it (422, half a release, 0.1.4), and a draft is invisible to
+        # the updater until the linux job has uploaded too and makes it public
+        run: |
+          $v = node -p "require('./package.json').version"
+          gh release view "v$v" -R ${{ github.repository }} *> $null
+          if ($LASTEXITCODE -ne 0) { gh release create "v$v" -R ${{ github.repository }} --draft --title $v --notes "Keelson ADE $v" }
+          npx electron-builder --win --publish always
 
   # Step 6, update while busy: the latest published release, installed as a user has
   # it, mid-turn, is offered this build from a feed on 127.0.0.1 (its installed
@@ -344,4 +352,7 @@ jobs:
       - name: Publish release (publish=true only)
         if: ${{ success() && inputs.publish && needs.windows.result == 'success' }}
         env: { GH_TOKEN: '${{ secrets.GH_TOKEN }}' }
-        run: npx electron-builder --linux --publish always
+        run: |
+          npx electron-builder --linux --publish always
+          v=$(node -p "require('./package.json').version")
+          gh release edit "v$v" -R ${{ github.repository }} --draft=false --latest
