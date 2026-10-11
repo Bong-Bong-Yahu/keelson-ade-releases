@@ -191,10 +191,6 @@ jobs:
   update:
     needs: windows
     if: ${{ !cancelled() && !inputs.publish && needs.windows.outputs.version != '' }}
-    # non-blocking (owner, 2026-10-11): step 6 reports its ROBOT lines in its summary
-    # but cannot fail the run; 6a-6d pass, restore after the update (5b) is open:
-    # see docs/qa/2026-10-11-first-five-minutes.md in the source repo
-    continue-on-error: true
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
