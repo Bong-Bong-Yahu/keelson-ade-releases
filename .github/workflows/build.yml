@@ -39,6 +39,38 @@ jobs:
           Get-Content smoke.out, smoke.err
           if ($p.ExitCode -ne 0) { Write-Error "smoke exited $($p.ExitCode)"; exit 1 }
           if (-not (Select-String -Path smoke.out -Pattern 'SMOKE OK' -Quiet)) { Write-Error 'no SMOKE OK'; exit 1 }
+      # A terminal must show text: the installed app, seeded with one restored
+      # Claude chat agent (team view) and then one shell (grid view), presses
+      # Terminal the way a person does and measures what was drawn (smoketerm.js).
+      - name: Terminal smoke (team view chat Terminal, grid shell)
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          npm i -g @anthropic-ai/claude-code | Out-Null
+          $exe = "$env:LOCALAPPDATA\Programs\Keelson ADE\Keelson ADE.exe"
+          $proj = "$env:RUNNER_TEMP\proj"; New-Item -ItemType Directory -Force $proj | Out-Null
+          git -C $proj init -q
+          $cfg = "$env:APPDATA\aegis-ade"; New-Item -ItemType Directory -Force $cfg | Out-Null
+          $fail = 0
+          foreach ($run in @(@{ view = 'team'; agent = 'claude'; id = 't1' }, @{ view = 'grid'; agent = 'shell'; id = 'g1' })) {
+            $wb = @{ version = 1; activeWorkspaceId = 'w1'; ui = @{ view = $run.view }
+              workspaces = @(@{ id = 'w1'; title = 'proj'; cwd = $proj; color = '#d9b766'; slots = @(@{ id = $run.id; agent = $run.agent }) }) }
+            $wb | ConvertTo-Json -Depth 6 | Set-Content -Encoding utf8NoBOM "$cfg\workbench.json"
+            $out = "$env:RUNNER_TEMP\smoke-shots\$($run.view)"
+            # WaitForExit on the app alone: Start-Process -Wait would wait on the detached daemon and slot hosts too
+            $p = Start-Process $exe -ArgumentList '--smoke', '--smoke-term', "--smoke-out=$out" -PassThru -RedirectStandardOutput "smoke-term-$($run.view).out" -RedirectStandardError "smoke-term-$($run.view).err"
+            if (-not $p.WaitForExit(300000)) { Stop-Process -Id $p.Id -Force; Write-Host "smoke-term $($run.view) hung" }
+            Get-Content "smoke-term-$($run.view).out" | Select-String 'SMOKE|board|slot'
+            if (-not (Select-String -Path "smoke-term-$($run.view).out" -Pattern 'SMOKE OK' -Quiet)) { $fail = 1 }
+          }
+          Get-Content "$env:TEMP\aegis-ade\boardd.log" -ErrorAction SilentlyContinue | Select-Object -Last 40
+          exit $fail
+      - if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: terminal-smoke-shots
+          path: ${{ runner.temp }}/smoke-shots
+          if-no-files-found: warn
       - if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
