@@ -13,11 +13,22 @@ name: Build
 # Claude Code on Haiku only when the ANTHROPIC_API_KEY secret exists; otherwise the
 # robot prints ROBOT SKIP 4. Step 6 (update while busy) installs the latest
 # published release and updates it to this build from a feed on 127.0.0.1.
+#
+# PUBLIC REPO: every log line and artifact here is world-readable. So the robot's
+# output stays on the runner ($OUT, $ROBOT_CHECKS) and only qa/robot/publish.mjs's
+# result leaves it: screenshots and a summary of ROBOT/CHECK lines, scanned for the
+# API key and the app's tokens first (a hit fails the job and uploads nothing). Never
+# upload or print app logs, transcripts, env, claude config or tokens; no `set -x`.
+# The only trigger is workflow_dispatch (write access needed): no push, pull_request
+# or pull_request_target, so no fork or PR can reach a secret.
 on:
   workflow_dispatch:
     inputs:
       ref: { description: 'Branch or tag of Bong-Bong-Yahu/aegis-ade', required: true, default: main }
       publish: { description: 'Publish a release (auto-update feed)', type: boolean, default: false }
+
+permissions:
+  contents: read
 
 jobs:
   windows:
@@ -35,19 +46,27 @@ jobs:
       # the installer and the robot's verdict are still there to look at
       - if: ${{ !cancelled() }}
         run: npx vite build
-      # a test build is one patch above the source's version (0.1.3-robot.<run>), so
-      # step 6 has something newer than the published release to update to; a
-      # publish build keeps package.json's version untouched
+      # a test build is one patch above the newer of the source's version and the
+      # latest published release (e.g. 0.1.4-robot.<run>), so step 6 has something
+      # newer to update to; a publish build keeps package.json's version untouched
       - id: version
         if: ${{ !cancelled() }}
         shell: pwsh
+        env: { GH_TOKEN: '${{ github.token }}' }
         run: |
           $v = node -p "require('./package.json').version"
-          if ('${{ inputs.publish }}' -ne 'true') { $p = $v.Split('-')[0].Split('.'); $v = "$($p[0]).$($p[1]).$([int]$p[2] + 1)-robot.${{ github.run_number }}" }
+          if ('${{ inputs.publish }}' -ne 'true') {
+            $base = [version]$v.Split('-')[0]
+            $tag = gh release view -R ${{ github.repository }} --json tagName -q .tagName 2>$null
+            if ($tag -and [version]$tag.TrimStart('v') -gt $base) { $base = [version]$tag.TrimStart('v') }
+            $v = "$($base.Major).$($base.Minor).$($base.Build + 1)-robot.${{ github.run_number }}"
+          }
           "version=$v" >> $env:GITHUB_OUTPUT
           Write-Host "building $v"
+      # bash: pwsh would split -c.extraMetadata... into "-c" and a config file name
       - if: ${{ !cancelled() }}
-        run: npx electron-builder --win --publish never -c.extraMetadata.version=${{ steps.version.outputs.version }}
+        shell: bash
+        run: npx electron-builder --win --publish never --config.extraMetadata.version=${{ steps.version.outputs.version }}
       - name: Robot setup (fresh profile, fake claude signed out, seeded repo)
         if: ${{ !cancelled() }}
         shell: pwsh
@@ -64,7 +83,8 @@ jobs:
           git init -q $repo; Set-Content "$repo\README.md" 'robot'; git -C $repo add -A; git -C $repo -c user.name=robot -c user.email=robot@example.invalid commit -qm seed
           "KEELSON_ROBOT_FOLDER=$repo" >> $env:GITHUB_ENV
           "FAKE_CLAUDE_STATE=$env:RUNNER_TEMP\fake-state" >> $env:GITHUB_ENV
-          "SHOTS=$env:RUNNER_TEMP\robot-shots" >> $env:GITHUB_ENV
+          "OUT=$env:RUNNER_TEMP\robot" >> $env:GITHUB_ENV
+          "ROBOT_CHECKS=$env:RUNNER_TEMP\robot-checks.txt" >> $env:GITHUB_ENV
       # 1b: Git hidden (PATH and the Program Files roots hasGitBash looks in), so the
       # app must offer Install Git. Its profile is then removed: `first` starts fresh.
       - name: Robot nogit (step 1b)
@@ -74,8 +94,11 @@ jobs:
           $env:Path = 'C:\fakeclaude;' + (($env:Path -split ';' | Where-Object { $_ -notmatch '\\Git\\' }) -join ';')
           $empty = New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\no-programs"
           $env:ProgramFiles = $empty; ${env:ProgramFiles(x86)} = $empty; $env:ProgramW6432 = $empty
-          pwsh qa/robot/run.ps1 -Script nogit -Out "$env:SHOTS\nogit"; $r = $LASTEXITCODE
+          pwsh qa/robot/run.ps1 -Script nogit -Out "$env:OUT\nogit"; $r = $LASTEXITCODE
           Get-Process 'Keelson ADE' -ErrorAction SilentlyContinue | Stop-Process -Force
+          # this profile's secrets are kept (runner-only) so the upload scan still knows them
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\old-secrets" | Out-Null
+          Copy-Item "$env:APPDATA\aegis-ade\board-token", "$env:APPDATA\aegis-ade\board-pass", "$env:APPDATA\aegis-ade\pipe-secret" "$env:RUNNER_TEMP\old-secrets" -ErrorAction SilentlyContinue
           Remove-Item -Recurse -Force "$env:APPDATA\aegis-ade", "$env:FAKE_CLAUDE_STATE\*" -ErrorAction SilentlyContinue
           exit $r
       - name: Robot first (steps 1-3, fake claude)
@@ -83,7 +106,7 @@ jobs:
         shell: pwsh
         run: |
           $env:Path = "C:\fakeclaude;$env:Path"
-          pwsh qa/robot/run.ps1 -Script first -Out "$env:SHOTS\run"
+          pwsh qa/robot/run.ps1 -Script first -Out "$env:OUT\run"
       - name: Robot agents (step 4, real claude on Haiku when the key exists)
         if: ${{ !cancelled() }}
         shell: pwsh
@@ -99,13 +122,14 @@ jobs:
             # the outside session: started here, not by the app, alive for the whole step
             $od = New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\outside"
             $env:ROBOT_REAL_CLAUDE = $real
-            $outside = Start-Process node -ArgumentList 'qa/robot/outside.js', 'robot-outside', $od, "$env:SHOTS\outside.jsonl" -PassThru -NoNewWindow
+            # its transcript stays on the runner (never under $OUT, never uploaded)
+            $outside = Start-Process node -ArgumentList 'qa/robot/outside.js', 'robot-outside', $od, "$env:RUNNER_TEMP\outside.jsonl" -PassThru -NoNewWindow -RedirectStandardOutput "$env:RUNNER_TEMP\outside.out" -RedirectStandardError "$env:RUNNER_TEMP\outside.err"
             $seen = $false
             for ($i = 0; $i -lt 60 -and -not $seen; $i++) { Start-Sleep 2; $seen = [bool](& $real agents --json 2>$null | Select-String 'robot-outside') }
             Write-Host "outside session registered: $seen"
             $env:KEELSON_ROBOT_REAL = '1'; $env:ROBOT_OUTSIDE = 'robot-outside'
           } else { Write-Host 'ANTHROPIC_API_KEY not set: step 4 is skipped' }
-          pwsh qa/robot/run.ps1 -Script agents -Out "$env:SHOTS\run"; $r = $LASTEXITCODE
+          pwsh qa/robot/run.ps1 -Script agents -Out "$env:OUT\run"; $r = $LASTEXITCODE
           if ($outside) { Stop-Process -Id $outside.Id -Force -ErrorAction SilentlyContinue; Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'robot-outside' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }
           exit $r
       - name: Robot restore (step 5, fake claude)
@@ -113,22 +137,25 @@ jobs:
         shell: pwsh
         run: |
           $env:Path = "C:\fakeclaude;$env:Path"
-          pwsh qa/robot/run.ps1 -Script restore -Out "$env:SHOTS\run"
+          pwsh qa/robot/run.ps1 -Script restore -Out "$env:OUT\run"
       - name: Reliability over the whole run (log, crash dumps, services)
         if: ${{ !cancelled() }}
         shell: pwsh
         run: |
           pwsh qa/robot/final.ps1 -Before "$env:RUNNER_TEMP\before.json"; $r = $LASTEXITCODE
-          New-Item -ItemType Directory -Force "$env:SHOTS\logs" | Out-Null
-          Copy-Item "$env:APPDATA\aegis-ade\logs\*" "$env:SHOTS\logs" -ErrorAction SilentlyContinue
-          Copy-Item "$env:TEMP\aegis-ade\boardd.log" "$env:SHOTS\logs" -ErrorAction SilentlyContinue
           Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like "$env:LOCALAPPDATA\Programs\Keelson ADE\*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
           exit $r
-      - if: ${{ !cancelled() }}
+      - name: Public summary (screenshots + ROBOT/CHECK lines, scanned for secrets)
+        id: public
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        env: { ROBOT_SCAN: '${{ secrets.ANTHROPIC_API_KEY }}' }
+        run: node qa/robot/publish.mjs "$env:OUT" "$env:RUNNER_TEMP\public" "$env:APPDATA\aegis-ade" "$env:RUNNER_TEMP\old-secrets"
+      - if: ${{ !cancelled() && steps.public.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
           name: robot-shots-windows
-          path: ${{ runner.temp }}/robot-shots
+          path: ${{ runner.temp }}/public
           if-no-files-found: warn
       - if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
@@ -182,7 +209,7 @@ jobs:
           $setup = Get-ChildItem "$env:RUNNER_TEMP\prev\Keelson-ADE-Setup-*.exe" | Select-Object -First 1
           Start-Process $setup.FullName -ArgumentList '/S' -Wait
           $res = "$env:LOCALAPPDATA\Programs\Keelson ADE\resources"
-          Write-Host "installed $tag; its app-update.yml:"; Get-Content "$res\app-update.yml"
+          Write-Host "installed $tag"
           $cache = (Get-Content "$res\app-update.yml" | Select-String '^updaterCacheDirName:').Line
           Set-Content "$res\app-update.yml" "provider: generic`nurl: http://127.0.0.1:8765/`n$cache`n"
           New-Item -ItemType Directory -Force C:\fakeclaude, "$env:RUNNER_TEMP\fake-state" | Out-Null
@@ -197,28 +224,33 @@ jobs:
             ConvertTo-Json -Depth 6 | Set-Content -Encoding utf8NoBOM "$cfg\workbench.json"
           "KEELSON_ROBOT_FOLDER=$repo" >> $env:GITHUB_ENV
           "FAKE_CLAUDE_STATE=$env:RUNNER_TEMP\fake-state" >> $env:GITHUB_ENV
-          "SHOTS=$env:RUNNER_TEMP\robot-shots" >> $env:GITHUB_ENV
+          "OUT=$env:RUNNER_TEMP\robot" >> $env:GITHUB_ENV
+          "ROBOT_CHECKS=$env:RUNNER_TEMP\robot-checks.txt" >> $env:GITHUB_ENV
       - name: Robot step 6 (update while busy), then restore on the updated app
         shell: pwsh
         run: |
           $env:Path = "C:\fakeclaude;$env:Path"
-          node qa/robot/update.mjs "$env:RUNNER_TEMP\feed" '${{ needs.windows.outputs.version }}' "$env:SHOTS\update"
+          node qa/robot/update.mjs "$env:RUNNER_TEMP\feed" '${{ needs.windows.outputs.version }}' "$env:OUT\update"
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          pwsh qa/robot/run.ps1 -Script restore -Out "$env:SHOTS\update"
+          pwsh qa/robot/run.ps1 -Script restore -Out "$env:OUT\update"
       - name: Reliability over the update run
         if: ${{ !cancelled() }}
         shell: pwsh
         run: |
           pwsh qa/robot/final.ps1 -Before "$env:RUNNER_TEMP\before.json"; $r = $LASTEXITCODE
-          New-Item -ItemType Directory -Force "$env:SHOTS\logs" | Out-Null
-          Copy-Item "$env:APPDATA\aegis-ade\logs\*" "$env:SHOTS\logs" -ErrorAction SilentlyContinue
           Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like "$env:LOCALAPPDATA\Programs\Keelson ADE\*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
           exit $r
-      - if: ${{ !cancelled() }}
+      - name: Public summary (screenshots + ROBOT/CHECK lines, scanned for secrets)
+        id: public
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        env: { ROBOT_SCAN: '${{ secrets.ANTHROPIC_API_KEY }}' }
+        run: node qa/robot/publish.mjs "$env:OUT" "$env:RUNNER_TEMP\public" "$env:APPDATA\aegis-ade" "$env:RUNNER_TEMP\old-secrets"
+      - if: ${{ !cancelled() && steps.public.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
           name: robot-shots-update
-          path: ${{ runner.temp }}/robot-shots
+          path: ${{ runner.temp }}/public
           if-no-files-found: warn
 
   linux:
@@ -237,32 +269,69 @@ jobs:
       - if: ${{ !cancelled() }}
         run: npx vite build
       - if: ${{ !cancelled() }}
-        run: npx electron-builder --linux --publish never -c.extraMetadata.version=${{ needs.windows.outputs.version || '' }}
-      - name: Robot (AppImage under xvfb, fake claude; step 4 is Windows-only)
+        run: npx electron-builder --linux --publish never ${{ needs.windows.outputs.version && format('--config.extraMetadata.version={0}', needs.windows.outputs.version) || '' }}
+      - name: Robot setup (AppImage, fake claude signed out, seeded repo)
         if: ${{ !cancelled() }}
         run: |
           sudo apt-get install -y -qq libfuse2t64 >/dev/null
           img=$(ls release/Keelson-ADE-*.AppImage | head -1); chmod +x "$img"
-          units() { { systemctl --user list-unit-files --no-legend 2>/dev/null; ls ~/.config/autostart 2>/dev/null; } | sort; }
-          units >"$RUNNER_TEMP/units.before"
+          { systemctl --user list-unit-files --no-legend 2>/dev/null; ls ~/.config/autostart 2>/dev/null || true; } | sort >"$RUNNER_TEMP/units.before"
           mkdir -p ~/fakeclaude "$RUNNER_TEMP/fake-state"
           cp tests/fixtures/fake-claude.js ~/fakeclaude/claude; chmod +x ~/fakeclaude/claude
-          export PATH=~/fakeclaude:$PATH FAKE_CLAUDE_STATE=$RUNNER_TEMP/fake-state KEELSON_ROBOT_FOLDER=$RUNNER_TEMP/robot-repo
-          git init -q "$KEELSON_ROBOT_FOLDER"; echo robot >"$KEELSON_ROBOT_FOLDER/README.md"
-          git -C "$KEELSON_ROBOT_FOLDER" add -A; git -C "$KEELSON_ROBOT_FOLDER" -c user.name=robot -c user.email=robot@example.invalid commit -qm seed
-          shots=$RUNNER_TEMP/robot-shots; fail=0
-          for s in first agents restore; do bash qa/robot/run.sh $s "$shots/run" "$img" || fail=1; done
-          log=~/.config/aegis-ade/logs/main.log
-          if grep -E '\[main\] (uncaught|unhandled|renderer gone)' "$log"; then echo "CHECK FAIL final no-uncaught"; fail=1; else echo "CHECK OK final no-uncaught"; fi
-          units >"$RUNNER_TEMP/units.after"
-          if diff "$RUNNER_TEMP/units.before" "$RUNNER_TEMP/units.after"; then echo "CHECK OK final no-service"; else echo "CHECK FAIL final no-service"; fail=1; fi
-          mkdir -p "$shots/logs"; cp ~/.config/aegis-ade/logs/* "$shots/logs/" 2>/dev/null || true
+          repo=$RUNNER_TEMP/robot-repo
+          git init -q "$repo"; echo robot >"$repo/README.md"
+          git -C "$repo" add -A; git -C "$repo" -c user.name=robot -c user.email=robot@example.invalid commit -qm seed
+          { echo "IMG=$PWD/$img"; echo "KEELSON_ROBOT_FOLDER=$repo"; echo "FAKE_CLAUDE_STATE=$RUNNER_TEMP/fake-state"
+            echo "OUT=$RUNNER_TEMP/robot"; echo "ROBOT_CHECKS=$RUNNER_TEMP/robot-checks.txt"; } >>"$GITHUB_ENV"
+      - name: Robot first (steps 1-3, fake claude)
+        if: ${{ !cancelled() }}
+        run: PATH=~/fakeclaude:$PATH bash qa/robot/run.sh first "$OUT/run" "$IMG"
+      - name: Robot agents (step 4, real claude on Haiku when the key exists)
+        if: ${{ !cancelled() }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_MODEL: claude-haiku-4-5
+        run: |
+          outside=
+          if [ -n "$ANTHROPIC_API_KEY" ]; then
+            npm i -g @anthropic-ai/claude-code >/dev/null 2>&1
+            real=$(command -v claude); echo "real claude: $($real --version)"
+            # the outside session: started here, not by the app; its transcript stays on the runner
+            mkdir -p "$RUNNER_TEMP/outside"
+            ROBOT_REAL_CLAUDE=$real node qa/robot/outside.js robot-outside "$RUNNER_TEMP/outside" "$RUNNER_TEMP/outside.jsonl" >"$RUNNER_TEMP/outside.out" 2>&1 &
+            outside=$!
+            seen=false; for i in $(seq 60); do sleep 2; "$real" agents --json 2>/dev/null | grep -q robot-outside && { seen=true; break; }; done
+            echo "outside session registered: $seen"
+            export KEELSON_ROBOT_REAL=1 ROBOT_OUTSIDE=robot-outside
+          else echo 'ANTHROPIC_API_KEY not set: step 4 is skipped'; fi
+          r=0; bash qa/robot/run.sh agents "$OUT/run" "$IMG" || r=$?
+          if [ -n "$outside" ]; then kill $outside 2>/dev/null || true; pkill -f robot-outside 2>/dev/null || true; fi
+          exit $r
+      - name: Robot restore (step 5, fake claude)
+        if: ${{ !cancelled() }}
+        run: PATH=~/fakeclaude:$PATH bash qa/robot/run.sh restore "$OUT/run" "$IMG"
+      - name: Reliability over the whole run (log, services)
+        if: ${{ !cancelled() }}
+        run: |
+          fail=0
+          check() { local l; if [ "$1" = 1 ]; then l="CHECK OK final $2 $3"; else l="CHECK FAIL final $2 $3"; fail=1; fi; echo "$l"; echo "$l" >>"$ROBOT_CHECKS"; }
+          # counts only, never the lines: main.log is the app's own log and this repo's output is public
+          n=$(cat ~/.config/aegis-ade/logs/main.log* 2>/dev/null | grep -cE '\[main\] (uncaught|unhandled|renderer gone)' || true)
+          check $([ "$n" = 0 ] && echo 1 || echo 0) no-uncaught "$n lines"
+          { systemctl --user list-unit-files --no-legend 2>/dev/null; ls ~/.config/autostart 2>/dev/null || true; } | sort >"$RUNNER_TEMP/units.after"
+          new=$(comm -13 "$RUNNER_TEMP/units.before" "$RUNNER_TEMP/units.after" | awk '{print $1}' | paste -sd,)
+          check $([ -z "$new" ] && echo 1 || echo 0) no-service "$new"
           exit $fail
-      - if: ${{ !cancelled() }}
+      - name: Public summary (screenshots + ROBOT/CHECK lines, scanned for secrets)
+        id: public
+        if: ${{ !cancelled() }}
+        env: { ROBOT_SCAN: '${{ secrets.ANTHROPIC_API_KEY }}' }
+        run: node qa/robot/publish.mjs "$OUT" "$RUNNER_TEMP/public" ~/.config/aegis-ade
+      - if: ${{ !cancelled() && steps.public.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
           name: robot-shots-linux
-          path: ${{ runner.temp }}/robot-shots
+          path: ${{ runner.temp }}/public
           if-no-files-found: warn
       - if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
