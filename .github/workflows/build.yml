@@ -80,7 +80,7 @@ jobs:
           # the fake installed the way npm installs claude: a .js and a cmd-shim beside it
           New-Item -ItemType Directory -Force C:\fakeclaude, "$env:RUNNER_TEMP\fake-state" | Out-Null
           Copy-Item tests\fixtures\fake-claude.js C:\fakeclaude\claude.js
-          Set-Content -NoNewline C:\fakeclaude\claude.cmd "@ECHO off`r`nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & `"%_prog%`"  `"%dp0%\claude.js`" %*`r`n"
+          [IO.File]::WriteAllText('C:\fakeclaude\claude.cmd', "@ECHO off`r`nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & `"%_prog%`"  `"%dp0%\claude.js`" %*`r`n")
           $repo = "$env:RUNNER_TEMP\robot-repo"
           git init -q $repo; Set-Content "$repo\README.md" 'robot'; git -C $repo add -A; git -C $repo -c user.name=robot -c user.email=robot@example.invalid commit -qm seed
           "KEELSON_ROBOT_FOLDER=$repo" >> $env:GITHUB_ENV
@@ -217,7 +217,7 @@ jobs:
           New-Item -ItemType Directory -Force C:\fakeclaude, "$env:RUNNER_TEMP\fake-state" | Out-Null
           Set-Content "$env:RUNNER_TEMP\fake-state\signed-in" 'robot'
           Copy-Item tests\fixtures\fake-claude.js C:\fakeclaude\claude.js
-          Set-Content -NoNewline C:\fakeclaude\claude.cmd "@ECHO off`r`nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & `"%_prog%`"  `"%dp0%\claude.js`" %*`r`n"
+          [IO.File]::WriteAllText('C:\fakeclaude\claude.cmd', "@ECHO off`r`nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & `"%_prog%`"  `"%dp0%\claude.js`" %*`r`n")
           $repo = "$env:RUNNER_TEMP\robot-repo"
           git init -q $repo; Set-Content "$repo\README.md" 'robot'; git -C $repo add -A; git -C $repo -c user.name=robot -c user.email=robot@example.invalid commit -qm seed
           $cfg = "$env:APPDATA\aegis-ade"; New-Item -ItemType Directory -Force $cfg | Out-Null
