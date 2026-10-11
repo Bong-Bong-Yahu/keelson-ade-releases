@@ -87,6 +87,8 @@ jobs:
         run: npx electron-builder --win --publish always
 
   linux:
+    # after windows: a release is never published half-made (Linux files, no Windows ones)
+    needs: windows
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
