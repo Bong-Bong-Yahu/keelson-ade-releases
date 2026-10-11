@@ -16,8 +16,10 @@ name: Build
 #
 # PUBLIC REPO: every log line and artifact here is world-readable. So the robot's
 # output stays on the runner ($OUT, $ROBOT_CHECKS) and only qa/robot/publish.mjs's
-# result leaves it: screenshots and a summary of ROBOT/CHECK lines, scanned for the
-# API key and the app's tokens first (a hit fails the job and uploads nothing). Never
+# result leaves it: the screenshots the robot vouched for as showing no secret
+# (shots.txt), and ROBOT lines cut to status/step/reason code plus CHECK lines,
+# byte-scanned for the API key and the app's tokens first (a hit fails the job and
+# uploads nothing; an unvouched shot is left behind and fails the job). Never
 # upload or print app logs, transcripts, env, claude config or tokens; no `set -x`.
 # The only trigger is workflow_dispatch (write access needed): no push, pull_request
 # or pull_request_target, so no fork or PR can reach a secret.
@@ -151,7 +153,7 @@ jobs:
         shell: pwsh
         env: { ROBOT_SCAN: '${{ secrets.ANTHROPIC_API_KEY }}' }
         run: node qa/robot/publish.mjs "$env:OUT" "$env:RUNNER_TEMP\public" "$env:APPDATA\aegis-ade" "$env:RUNNER_TEMP\old-secrets"
-      - if: ${{ !cancelled() && steps.public.outcome == 'success' }}
+      - if: ${{ !cancelled() && steps.public.outputs.upload == 'yes' }}
         uses: actions/upload-artifact@v4
         with:
           name: robot-shots-windows
@@ -246,7 +248,7 @@ jobs:
         shell: pwsh
         env: { ROBOT_SCAN: '${{ secrets.ANTHROPIC_API_KEY }}' }
         run: node qa/robot/publish.mjs "$env:OUT" "$env:RUNNER_TEMP\public" "$env:APPDATA\aegis-ade" "$env:RUNNER_TEMP\old-secrets"
-      - if: ${{ !cancelled() && steps.public.outcome == 'success' }}
+      - if: ${{ !cancelled() && steps.public.outputs.upload == 'yes' }}
         uses: actions/upload-artifact@v4
         with:
           name: robot-shots-update
@@ -327,7 +329,7 @@ jobs:
         if: ${{ !cancelled() }}
         env: { ROBOT_SCAN: '${{ secrets.ANTHROPIC_API_KEY }}' }
         run: node qa/robot/publish.mjs "$OUT" "$RUNNER_TEMP/public" ~/.config/aegis-ade
-      - if: ${{ !cancelled() && steps.public.outcome == 'success' }}
+      - if: ${{ !cancelled() && steps.public.outputs.upload == 'yes' }}
         uses: actions/upload-artifact@v4
         with:
           name: robot-shots-linux
