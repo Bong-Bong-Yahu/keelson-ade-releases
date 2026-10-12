@@ -189,7 +189,7 @@ jobs:
         run: |
           $v = node -p "require('./package.json').version"
           gh release view "v$v" -R ${{ github.repository }} *> $null
-          if ($LASTEXITCODE -ne 0) { gh release create "v$v" -R ${{ github.repository }} --draft --title $v --notes "Keelson ADE $v" }
+          if ($LASTEXITCODE -ne 0) { gh release create "v$v" -R ${{ github.repository }} --draft --title $v --notes-file build/release-notes.md }
           npx electron-builder --win --publish always
 
   # Step 6, update while busy: the latest published release, installed as a user has
