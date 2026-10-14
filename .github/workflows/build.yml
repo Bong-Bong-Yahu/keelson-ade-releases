@@ -69,6 +69,11 @@ jobs:
       - if: ${{ !cancelled() }}
         shell: bash
         run: npx electron-builder --win --publish never --config.extraMetadata.version=${{ steps.version.outputs.version }}
+      # the loopback gate tests its own process-tree walk first (PID reuse must never adopt
+      # Windows services); a broken walk fails here, before any robot result is trusted
+      - name: Loopback gate self-test
+        shell: pwsh
+        run: pwsh qa/robot/tree.selftest.ps1
       - name: Robot setup (fresh profile, fake claude signed out, seeded repo)
         if: ${{ !cancelled() }}
         shell: pwsh
